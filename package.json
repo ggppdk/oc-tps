@@ -2,6 +2,10 @@
   "$schema": "https://json.schemastore.org/package.json",
   "name": "oc-tps",
   "version": "0.0.8",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Tarquinen/oc-tps"
+  },
   "type": "module",
   "exports": {
     "./tui": {
