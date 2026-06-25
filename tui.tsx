@@ -1,6 +1,7 @@
 /** @jsxImportSource @opentui/solid */
+import type { TextRenderable } from "@opentui/core"
 import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui"
-import { createMemo, createSignal } from "solid-js"
+import { onCleanup } from "solid-js"
 
 type StreamSample = {
   at: number
@@ -31,6 +32,8 @@ type TrackerState = {
   messageTimingByID: Record<string, MessageTiming>
   sessionAverageByID: Record<string, SessionAverage>
 }
+
+type TrackerListener = () => void
 
 function estimateStreamTokens(delta: string) {
   return Math.max(1, Math.ceil(Buffer.byteLength(delta, "utf8") / 5))
@@ -71,26 +74,44 @@ function SessionPromptRight(props: {
   api: Parameters<TuiPlugin>[0]
   sessionID: string
   tracker: TrackerState
-  version: () => number
-  clock: () => number
+  subscribe: (listener: TrackerListener) => () => void
 }) {
-  const sessionAverage = createMemo(() => {
-    props.version()
+  let text: TextRenderable | undefined
+
+  const sync = () => {
+    if (!text) return
+    text.content = statusText()
+    props.api.renderer.requestRender()
+  }
+
+  const unsubscribe = props.subscribe(sync)
+  onCleanup(unsubscribe)
+
+  return (
+    <text
+      ref={(ref: TextRenderable) => {
+        text = ref
+        sync()
+      }}
+      fg={props.api.theme.current.textMuted}
+    >
+      {statusText()}
+    </text>
+  )
+
+  function sessionAverage() {
     const totals = props.tracker.sessionAverageByID[props.sessionID]
     if (!totals || totals.totalTokens <= 0 || totals.totalDurationMs <= 0) return undefined
     return formatRate(totals.totalTokens / (totals.totalDurationMs / 1000), "AVG")
-  })
+  }
 
-  const sessionTtft = createMemo(() => {
-    props.version()
+  function sessionTtft() {
     const totals = props.tracker.sessionAverageByID[props.sessionID]
     if (!totals || totals.messageCount <= 0 || totals.totalTtftMs < 0) return undefined
     return formatTtft(totals.totalTtftMs / totals.messageCount / 1000)
-  })
+  }
 
-  const liveTps = createMemo(() => {
-    props.version()
-    props.clock()
+  function liveTps() {
     const status = props.api.state.session.status(props.sessionID)
     if (status?.type === "idle") return undefined
     const samples = props.tracker.streamSamplesBySession[props.sessionID] ?? []
@@ -103,17 +124,15 @@ function SessionPromptRight(props: {
     const total = relevant.reduce((sum, sample) => sum + sample.tokens, 0)
     const durationSeconds = activeDurationMs(relevant, now) / 1000
     if (durationSeconds <= 0) return undefined
-    return formatRate(total / durationSeconds, "AVG")
-  })
+    return formatRate(total / durationSeconds, "TPS")
+  }
 
-  const text = createMemo(() => {
+  function statusText() {
     const live = liveTps() ?? "-"
     const avg = sessionAverage() ?? "-"
     const ttft = sessionTtft() ?? "-"
     return `TPS ${live} | AVG ${avg} | TTFT ${ttft}`
-  })
-
-  return <>{text() ? <text fg={props.api.theme.current.textMuted}>{text()}</text> : null}</>
+  }
 }
 
 const tui: TuiPlugin = async (api) => {
@@ -122,10 +141,11 @@ const tui: TuiPlugin = async (api) => {
     messageTimingByID: {},
     sessionAverageByID: {},
   }
-  const [version, setVersion] = createSignal(0)
-  const [clock, setClock] = createSignal(Date.now())
+  const listeners = new Set<TrackerListener>()
 
-  const bump = () => setVersion((value) => value + 1)
+  const bump = () => {
+    for (const listener of listeners) listener()
+  }
 
   const pruneSamples = (now = Date.now()) => {
     let changed = false
@@ -182,11 +202,12 @@ const tui: TuiPlugin = async (api) => {
 
   const onMessage = api.event.on("message.updated", (evt) => {
     if (evt.properties.info.role !== "assistant") return
+    const sessionID = evt.properties.info.sessionID ?? evt.properties.sessionID
 
     if (!evt.properties.info.time.completed) {
       const existing = tracker.messageTimingByID[evt.properties.info.id]
       tracker.messageTimingByID[evt.properties.info.id] = {
-        sessionID: evt.properties.sessionID,
+        sessionID,
         requestStartAt: evt.properties.info.time.created,
         firstResponseAt: existing?.firstResponseAt,
         firstTokenAt: existing?.firstTokenAt,
@@ -198,7 +219,7 @@ const tui: TuiPlugin = async (api) => {
     }
 
     const timing = tracker.messageTimingByID[evt.properties.info.id]
-    if (timing?.sessionID === evt.properties.sessionID && typeof timing.firstResponseAt === "number") {
+    if (timing?.sessionID === sessionID && typeof timing.firstResponseAt === "number") {
       const totalTokens = evt.properties.info.tokens.output + evt.properties.info.tokens.reasoning
       const endAt =
         evt.properties.info.finish === "tool-calls"
@@ -207,13 +228,13 @@ const tui: TuiPlugin = async (api) => {
       const durationMs = typeof endAt === "number" ? Math.max(endAt - timing.firstResponseAt, 1) : undefined
       const ttftMs = Math.max(timing.firstResponseAt - timing.requestStartAt, 0)
       if (totalTokens > 0 && durationMs) {
-        const totals = tracker.sessionAverageByID[evt.properties.sessionID] ?? {
+        const totals = tracker.sessionAverageByID[sessionID] ?? {
           totalTokens: 0,
           totalDurationMs: 0,
           totalTtftMs: 0,
           messageCount: 0,
         }
-        tracker.sessionAverageByID[evt.properties.sessionID] = {
+        tracker.sessionAverageByID[sessionID] = {
           totalTokens: totals.totalTokens + totalTokens,
           totalDurationMs: totals.totalDurationMs + durationMs,
           totalTtftMs: totals.totalTtftMs + ttftMs,
@@ -228,12 +249,13 @@ const tui: TuiPlugin = async (api) => {
 
   const onPart = api.event.on("message.part.updated", (evt) => {
     if (evt.properties.part.type !== "tool") return
+    const sessionID = evt.properties.part.sessionID ?? evt.properties.sessionID
     if (
       evt.properties.part.state.status === "running" ||
       evt.properties.part.state.status === "completed" ||
       evt.properties.part.state.status === "error"
     ) {
-      clearLiveSamples(evt.properties.sessionID)
+      clearLiveSamples(sessionID)
     }
     const timing = tracker.messageTimingByID[evt.properties.part.messageID]
     if (!timing) return
@@ -254,8 +276,8 @@ const tui: TuiPlugin = async (api) => {
   })
 
   const timer = setInterval(() => {
-    setClock(Date.now())
     pruneSamples()
+    bump()
   }, 1000)
 
   api.lifecycle.onDispose(() => {
@@ -268,7 +290,12 @@ const tui: TuiPlugin = async (api) => {
   api.slots.register({
     slots: {
       session_prompt_right(_ctx, value) {
-        return <SessionPromptRight api={api} sessionID={value.session_id} tracker={tracker} version={version} clock={clock} />
+        return <SessionPromptRight api={api} sessionID={value.session_id} tracker={tracker} subscribe={(listener) => {
+          listeners.add(listener)
+          return () => {
+            listeners.delete(listener)
+          }
+        }} />
       },
     },
   })
