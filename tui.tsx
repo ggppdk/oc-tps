@@ -1,7 +1,6 @@
 /** @jsxImportSource @opentui/solid */
-import type { TextRenderable } from "@opentui/core"
 import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui"
-import { onCleanup } from "solid-js"
+import { createMemo, createSignal } from "solid-js"
 
 type StreamSample = {
   at: number
@@ -32,8 +31,6 @@ type TrackerState = {
   messageTimingByID: Record<string, MessageTiming>
   sessionAverageByID: Record<string, SessionAverage>
 }
-
-type TrackerListener = () => void
 
 function estimateStreamTokens(delta: string) {
   return Math.max(1, Math.ceil(Buffer.byteLength(delta, "utf8") / 5))
@@ -74,44 +71,26 @@ function SessionPromptRight(props: {
   api: Parameters<TuiPlugin>[0]
   sessionID: string
   tracker: TrackerState
-  subscribe: (listener: TrackerListener) => () => void
+  version: () => number
+  clock: () => number
 }) {
-  let text: TextRenderable | undefined
-
-  const sync = () => {
-    if (!text) return
-    text.content = statusText()
-    props.api.renderer.requestRender()
-  }
-
-  const unsubscribe = props.subscribe(sync)
-  onCleanup(unsubscribe)
-
-  return (
-    <text
-      ref={(ref: TextRenderable) => {
-        text = ref
-        sync()
-      }}
-      fg={props.api.theme.current.textMuted}
-    >
-      {statusText()}
-    </text>
-  )
-
-  function sessionAverage() {
+  const sessionAverage = createMemo(() => {
+    props.version()
     const totals = props.tracker.sessionAverageByID[props.sessionID]
     if (!totals || totals.totalTokens <= 0 || totals.totalDurationMs <= 0) return undefined
     return formatRate(totals.totalTokens / (totals.totalDurationMs / 1000), "AVG")
-  }
+  })
 
-  function sessionTtft() {
+  const sessionTtft = createMemo(() => {
+    props.version()
     const totals = props.tracker.sessionAverageByID[props.sessionID]
     if (!totals || totals.messageCount <= 0 || totals.totalTtftMs < 0) return undefined
     return formatTtft(totals.totalTtftMs / totals.messageCount / 1000)
-  }
+  })
 
-  function liveTps() {
+  const liveTps = createMemo(() => {
+    props.version()
+    props.clock()
     const status = props.api.state.session.status(props.sessionID)
     if (status?.type === "idle") return undefined
     const samples = props.tracker.streamSamplesBySession[props.sessionID] ?? []
@@ -125,14 +104,16 @@ function SessionPromptRight(props: {
     const durationSeconds = activeDurationMs(relevant, now) / 1000
     if (durationSeconds <= 0) return undefined
     return formatRate(total / durationSeconds, "TPS")
-  }
+  })
 
-  function statusText() {
+  const text = createMemo(() => {
     const live = liveTps() ?? "-"
     const avg = sessionAverage() ?? "-"
     const ttft = sessionTtft() ?? "-"
     return `TPS ${live} | AVG ${avg} | TTFT ${ttft}`
-  }
+  })
+
+  return <>{text() ? <text fg={props.api.theme.current.textMuted}>{text()}</text> : null}</>
 }
 
 const tui: TuiPlugin = async (api) => {
@@ -141,11 +122,10 @@ const tui: TuiPlugin = async (api) => {
     messageTimingByID: {},
     sessionAverageByID: {},
   }
-  const listeners = new Set<TrackerListener>()
+  const [version, setVersion] = createSignal(0)
+  const [clock, setClock] = createSignal(Date.now())
 
-  const bump = () => {
-    for (const listener of listeners) listener()
-  }
+  const bump = () => setVersion((value) => value + 1)
 
   const pruneSamples = (now = Date.now()) => {
     let changed = false
@@ -276,8 +256,8 @@ const tui: TuiPlugin = async (api) => {
   })
 
   const timer = setInterval(() => {
+    setClock(Date.now())
     pruneSamples()
-    bump()
   }, 1000)
 
   api.lifecycle.onDispose(() => {
@@ -290,12 +270,7 @@ const tui: TuiPlugin = async (api) => {
   api.slots.register({
     slots: {
       session_prompt_right(_ctx, value) {
-        return <SessionPromptRight api={api} sessionID={value.session_id} tracker={tracker} subscribe={(listener) => {
-          listeners.add(listener)
-          return () => {
-            listeners.delete(listener)
-          }
-        }} />
+        return <SessionPromptRight api={api} sessionID={value.session_id} tracker={tracker} version={version} clock={clock} />
       },
     },
   })
